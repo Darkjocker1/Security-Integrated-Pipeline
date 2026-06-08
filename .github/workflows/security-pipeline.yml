@@ -94,7 +94,7 @@ jobs:
           image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           format: table
           exit-code: "1"
-          severity: CRITICAL,HIGH
+          severity: CRITICAL,HIGHd
           ignore-unfixed: true
 
       - name: Upload Trivy report
