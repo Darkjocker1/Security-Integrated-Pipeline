@@ -1,160 +1,124 @@
-from flask import Blueprint, request, jsonify
-from flask_jwt_extended import jwt_required, get_jwt_identity, create_access_token
+from flask import Blueprint, current_app, jsonify, request
+from flask_jwt_extended import get_jwt_identity, jwt_required
+
 from app.extensions import db
 from app.models import Note
-from app.auth import register_user, login_user
 
-api = Blueprint("api", __name__)
+api_bp = Blueprint("api", __name__, url_prefix="/api")
+health_bp = Blueprint("health", __name__)
 
-
-@api.route("/health")
-def health():
-    return jsonify({"status": "ok"}), 200
+MAX_TITLE_LENGTH = 120
+MAX_CONTENT_LENGTH = 10_000
 
 
-@api.route("/version")
-def version():
-    return jsonify({"version": "1.0.0"}), 200
+def _current_user_id() -> int:
+    return int(get_jwt_identity())
 
 
-# --- Auth ---
+def _validate_note_payload(payload: dict | None, require_title: bool = True):
+    """Return (title, content, error_response)."""
+    payload = payload or {}
+    title = payload.get("title")
+    content = payload.get("content", "")
 
-@api.route("/auth/register", methods=["POST"])
-def register():
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "Request body required"}), 400
+    if title is not None:
+        title = str(title).strip()
+    if require_title and not title:
+        return None, None, (jsonify(error="Field 'title' is required."), 400)
+    if title is not None and len(title) > MAX_TITLE_LENGTH:
+        return (
+            None,
+            None,
+            (
+                jsonify(error=f"Title exceeds {MAX_TITLE_LENGTH} characters."),
+                400,
+            ),
+        )
 
-    username = data.get("username", "").strip()
-    email = data.get("email", "").strip()
-    password = data.get("password", "")
+    content = str(content)
+    if len(content) > MAX_CONTENT_LENGTH:
+        return (
+            None,
+            None,
+            (
+                jsonify(error=f"Content exceeds {MAX_CONTENT_LENGTH} characters."),
+                400,
+            ),
+        )
 
-    if not username or not email or not password:
-        return jsonify({"error": "username, email, and password are required"}), 400
-    if len(password) < 8:
-        return jsonify({"error": "Password must be at least 8 characters"}), 400
-
-    user, error = register_user(username, email, password)
-    if error:
-        return jsonify({"error": error}), 409
-
-    return jsonify({"message": "User created", "username": user.username}), 201
-
-
-@api.route("/auth/login", methods=["POST"])
-def login():
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "Request body required"}), 400
-
-    username = data.get("username", "").strip()
-    password = data.get("password", "")
-
-    if not username or not password:
-        return jsonify({"error": "username and password are required"}), 400
-
-    access_token, refresh_token, error = login_user(username, password)
-    if error:
-        return jsonify({"error": error}), 401
-
-    return jsonify({"access_token": access_token, "refresh_token": refresh_token}), 200
+    return title, content, None
 
 
-@api.route("/auth/refresh", methods=["POST"])
-@jwt_required(refresh=True)
-def refresh():
-    identity = get_jwt_identity()
-    access_token = create_access_token(identity=identity)
-    return jsonify({"access_token": access_token}), 200
+def _get_owned_note(note_id: int) -> Note | None:
+    return Note.query.filter_by(id=note_id, user_id=_current_user_id()).first()
 
 
-# --- Notes ---
-
-@api.route("/notes", methods=["GET"])
+@api_bp.get("/notes")
 @jwt_required()
-def get_notes():
-    user_id = int(get_jwt_identity())
-    notes = Note.query.filter_by(user_id=user_id).all()
-    return jsonify([
-        {
-            "id": n.id,
-            "title": n.title,
-            "content": n.content,
-            "created_at": n.created_at.isoformat(),
-            "updated_at": n.updated_at.isoformat(),
-        }
-        for n in notes
-    ]), 200
+def list_notes():
+    notes = Note.query.filter_by(user_id=_current_user_id()).order_by(Note.created_at.desc()).all()
+    return jsonify([note.to_dict() for note in notes])
 
 
-@api.route("/notes", methods=["POST"])
+@api_bp.post("/notes")
 @jwt_required()
 def create_note():
-    user_id = int(get_jwt_identity())
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "Request body required"}), 400
+    title, content, error = _validate_note_payload(request.get_json(silent=True))
+    if error:
+        return error
 
-    title = data.get("title", "").strip()
-    if not title:
-        return jsonify({"error": "title is required"}), 400
-
-    note = Note(title=title, content=data.get("content", ""), user_id=user_id)
+    note = Note(user_id=_current_user_id(), title=title, content=content)
     db.session.add(note)
     db.session.commit()
-    return jsonify({"id": note.id, "title": note.title}), 201
+    return jsonify(note.to_dict()), 201
 
 
-@api.route("/notes/<int:note_id>", methods=["GET"])
+@api_bp.get("/notes/<int:note_id>")
 @jwt_required()
-def get_note(note_id):
-    user_id = int(get_jwt_identity())
-    note = Note.query.filter_by(id=note_id, user_id=user_id).first()
-    if not note:
-        return jsonify({"error": "Note not found"}), 404
-
-    return jsonify({
-        "id": note.id,
-        "title": note.title,
-        "content": note.content,
-        "created_at": note.created_at.isoformat(),
-        "updated_at": note.updated_at.isoformat(),
-    }), 200
+def get_note(note_id: int):
+    note = _get_owned_note(note_id)
+    if note is None:
+        return jsonify(error="Note not found."), 404
+    return jsonify(note.to_dict())
 
 
-@api.route("/notes/<int:note_id>", methods=["PUT"])
+@api_bp.put("/notes/<int:note_id>")
 @jwt_required()
-def update_note(note_id):
-    user_id = int(get_jwt_identity())
-    note = Note.query.filter_by(id=note_id, user_id=user_id).first()
-    if not note:
-        return jsonify({"error": "Note not found"}), 404
+def update_note(note_id: int):
+    note = _get_owned_note(note_id)
+    if note is None:
+        return jsonify(error="Note not found."), 404
 
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "Request body required"}), 400
+    payload = request.get_json(silent=True) or {}
+    title, content, error = _validate_note_payload(payload, require_title=False)
+    if error:
+        return error
 
-    if "title" in data:
-        title = data["title"].strip()
-        if not title:
-            return jsonify({"error": "title cannot be empty"}), 400
+    if title:
         note.title = title
-
-    if "content" in data:
-        note.content = data["content"]
-
+    if "content" in payload:
+        note.content = content
     db.session.commit()
-    return jsonify({"id": note.id, "title": note.title}), 200
+    return jsonify(note.to_dict())
 
 
-@api.route("/notes/<int:note_id>", methods=["DELETE"])
+@api_bp.delete("/notes/<int:note_id>")
 @jwt_required()
-def delete_note(note_id):
-    user_id = int(get_jwt_identity())
-    note = Note.query.filter_by(id=note_id, user_id=user_id).first()
-    if not note:
-        return jsonify({"error": "Note not found"}), 404
+def delete_note(note_id: int):
+    note = _get_owned_note(note_id)
+    if note is None:
+        return jsonify(error="Note not found."), 404
 
     db.session.delete(note)
     db.session.commit()
-    return jsonify({"message": "Note deleted"}), 200
+    return jsonify(message="Note deleted.")
+
+
+@health_bp.get("/health")
+def health():
+    return jsonify(status="ok")
+
+
+@api_bp.get("/version")
+def version():
+    return jsonify(version=current_app.config["APP_VERSION"])

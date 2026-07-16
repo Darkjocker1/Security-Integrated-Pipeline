@@ -1,44 +1,50 @@
 import os
 from datetime import timedelta
 
+from dotenv import load_dotenv
 
-class Config:
-    SECRET_KEY = os.environ.get("SECRET_KEY", "change-me-in-production")
+load_dotenv()
+
+
+class BaseConfig:
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    JWT_ACCESS_TOKEN_EXPIRES = timedelta(minutes=15)
+    JWT_REFRESH_TOKEN_EXPIRES = timedelta(days=7)
+    APP_VERSION = os.environ.get("APP_VERSION", "1.0.0")
 
-    JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "change-me-in-production")
-    JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=1)
-    JWT_REFRESH_TOKEN_EXPIRES = timedelta(days=30)
 
-
-class DevelopmentConfig(Config):
+class DevelopmentConfig(BaseConfig):
     DEBUG = True
-    SQLALCHEMY_DATABASE_URI = os.environ.get(
-        "DATABASE_URL", "sqlite:///dev.db"
-    )
+    # Low-entropy placeholder for local dev only; real values belong in .env
+    SECRET_KEY = os.environ.get("SECRET_KEY", "dev-only-placeholder")
+    JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", SECRET_KEY)
+    SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", "sqlite:///dev.db")
 
 
-class TestingConfig(Config):
+class TestingConfig(BaseConfig):
     TESTING = True
+    SECRET_KEY = "testing"
+    JWT_SECRET_KEY = "testing"
     SQLALCHEMY_DATABASE_URI = "sqlite:///:memory:"
-    JWT_ACCESS_TOKEN_EXPIRES = timedelta(minutes=5)
 
 
-class ProductionConfig(Config):
+class ProductionConfig(BaseConfig):
     DEBUG = False
-    SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL")
+    SECRET_KEY = os.environ.get("SECRET_KEY")
+    JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY")
+    SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", "")
 
-    SECRET_KEY = os.environ["SECRET_KEY"]
-    JWT_SECRET_KEY = os.environ["JWT_SECRET_KEY"]
 
-
-config_map = {
+_CONFIGS = {
     "development": DevelopmentConfig,
     "testing": TestingConfig,
     "production": ProductionConfig,
 }
 
 
-def get_config():
-    env = os.environ.get("FLASK_ENV", "development")
-    return config_map.get(env, DevelopmentConfig)
+def get_config(name: str):
+    """Return the config class for the given environment name."""
+    try:
+        return _CONFIGS[name]
+    except KeyError as exc:
+        raise ValueError(f"Unknown config name: {name!r}") from exc

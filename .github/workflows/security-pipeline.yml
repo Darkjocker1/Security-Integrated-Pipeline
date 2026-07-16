@@ -5,121 +5,148 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  IMAGE_NAME: devsecops-pipeline
+
 jobs:
-  pipeline:
-    name: Build, Test & Scan
+  # ---------------------------------------------------------------
+  # Stage 1: Lint + unit tests
+  # ---------------------------------------------------------------
+  lint-and-test:
+    name: Lint & Unit Tests
     runs-on: ubuntu-latest
-
-    env:
-      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/security-integrated-pipeline
-
     steps:
-      #Checkout
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Gitleaks
 
-      #Set up Python 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      #Install dependencies 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
-      #Lint
       - name: Lint (flake8)
-        run: flake8 app/ --max-line-length=120
+        run: flake8 app tests
 
       - name: Format check (black)
-        run: black --check app/
+        run: black --check app tests
 
-      #Unit tests
-      - name: Run unit tests
-        env:
-          FLASK_ENV: testing
-          SECRET_KEY: ${{ secrets.SECRET_KEY }}
-          JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
-        run: pytest --tb=short -q
+      - name: Run unit tests (pytest)
+        run: pytest
 
-      #SAST — Bandit 
-      - name: SAST scan (Bandit)
-        run: |
-          pip install bandit
-          bandit -r app/ -ll -ii --exit-zero-on-skipped -f json -o bandit-report.json
-          bandit -r app/ -ll -ii --exit-zero-on-skipped
+  # ---------------------------------------------------------------
+  # Stage 2: SAST - static analysis of source code
+  # Fails on MEDIUM+ severity findings (-ll) at MEDIUM+ confidence (-ii)
+  # ---------------------------------------------------------------
+  sast:
+    name: SAST (Bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Upload Bandit report
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          name: bandit-report
-          path: bandit-report.json
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      # Secrets scan — Gitleaks 
-      - name: Secrets scan (Gitleaks)
+      - name: Install Bandit
+        run: pip install bandit
+
+      - name: Run Bandit
+        run: bandit -r app -ll -ii
+
+  # ---------------------------------------------------------------
+  # Stage 3: Secrets detection - full git history scan
+  # Fails on ANY leaked credential
+  # ---------------------------------------------------------------
+  secrets-scan:
+    name: Secrets Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      #Dependency scan — pip-audit 
-      - name: Dependency scan (pip-audit)
-        run: |
-          pip install pip-audit
-          pip-audit -r requirements.txt --output json -o pip-audit-report.json
-          pip-audit -r requirements.txt
+  # ---------------------------------------------------------------
+  # Stage 4: SCA - dependency vulnerability scan against PyPI Advisory DB
+  # Fails on any known CVE in pinned dependencies
+  # ---------------------------------------------------------------
+  dependency-scan:
+    name: SCA (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Upload pip-audit report
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          name: pip-audit-report
-          path: pip-audit-report.json
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      #Build Docker image
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Run pip-audit
+        run: pip-audit -r requirements.txt --desc
+
+  # ---------------------------------------------------------------
+  # Stage 5: Build image + container scan
+  # Trivy fails the job on CRITICAL/HIGH vulnerabilities with fixes
+  # ---------------------------------------------------------------
+  container-scan:
+    name: Build & Container Scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, sast, secrets-scan, dependency-scan]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Build Docker image
-        run: docker build -f docker/Dockerfile -t ${{ env.IMAGE_NAME }}:${{ github.sha }} -t ${{ env.IMAGE_NAME }}:latest .
+        run: docker build -f docker/Dockerfile -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
 
-      # Container scan — Trivy
-      - name: Container scan (Trivy)
-        uses: aquasecurity/trivy-action@master
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           format: table
           exit-code: "1"
-          severity: CRITICAL,HIGHd
+          severity: CRITICAL,HIGH
           ignore-unfixed: true
 
-      - name: Upload Trivy report
-        if: always()
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
-          format: sarif
-          output: trivy-report.sarif
-          ignore-unfixed: true
-
-      - name: Upload Trivy SARIF to GitHub Security tab
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-report.sarif
-
-      #Push image to Docker Hub 
+      # -----------------------------------------------------------
+      # Optional publish: create a repository variable
+      # DOCKERHUB_ENABLED=true and secrets DOCKERHUB_USERNAME /
+      # DOCKERHUB_TOKEN to activate these steps.
+      # -----------------------------------------------------------
       - name: Log in to Docker Hub
+        if: vars.DOCKERHUB_ENABLED == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Push image to Docker Hub
+        if: vars.DOCKERHUB_ENABLED == 'true'
         run: |
-          docker push ${{ env.IMAGE_NAME }}:${{ github.sha }}
-          docker push ${{ env.IMAGE_NAME }}:latest
+          docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+          docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
