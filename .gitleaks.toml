@@ -1,0 +1,7 @@
+# Extends the default Gitleaks ruleset.
+[extend]
+useDefault = true
+
+# Test fixtures contain obvious fake credentials; everything else is scanned.
+[allowlist]
+paths = ['''tests/.*''']
